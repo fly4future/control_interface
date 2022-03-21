@@ -6,6 +6,7 @@
 #include <fog_msgs/msg/detail/navigation_diagnostics__struct.hpp>
 #include <geometry_msgs/msg/pose_array.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
+#include <limits>
 #include <mavsdk/geometry.h>
 #include <mavsdk/mavsdk.h>
 #include <mavsdk/log_callback.h>
@@ -190,6 +191,9 @@ public:
   ControlInterface(rclcpp::NodeOptions options);
 
 private:
+
+  static constexpr float nanf = std::numeric_limits<float>::quiet_NaN();
+
   std::recursive_mutex state_mutex_;
   vehicle_state_t vehicle_state_ = vehicle_state_t::not_connected;
   std::string vehicle_state_str_ = "MavSDK system not connected";
@@ -385,8 +389,8 @@ private:
   bool startNewMission(const T& path, const uint32_t id, const bool is_global, std::string& fail_reason_out);
 
   template <typename T>
-  mavsdk::Mission::MissionItem to_mission_item(const T& w_in, const bool is_global);
-  mavsdk::Mission::MissionItem to_mission_item(const local_waypoint_t& w_in);
+  mavsdk::Mission::MissionItem to_mission_item(const T& w_in, const bool is_global, const bool flythrough = false);
+  mavsdk::Mission::MissionItem to_mission_item(const local_waypoint_t& w_in, const bool flythrough = false);
 
   local_waypoint_t to_local_waypoint(const local_waypoint_t& in, [[maybe_unused]] const bool is_global);
   local_waypoint_t to_local_waypoint(const geometry_msgs::msg::PoseStamped& in, const bool is_global);
@@ -1056,8 +1060,12 @@ bool ControlInterface::startNewMission(const T& path, const uint32_t id, const b
   // convert the path to a MissionPlan for pixhawk
   mavsdk::Mission::MissionPlan mission_plan;
   mission_plan.mission_items.reserve(path.size());
-  for (const auto& pose : path)
-    mission_plan.mission_items.push_back(to_mission_item(pose, is_global));
+  for (size_t it = 0; it < path.size(); it++)
+  {
+    const auto& pose = path.at(it);
+    const bool endpoint = it == path.size()-1;
+    mission_plan.mission_items.push_back(to_mission_item(pose, is_global, !endpoint));
+  }
 
   // stop the current mission (if any)
   std::string fail_reason;
@@ -1971,7 +1979,7 @@ bool ControlInterface::gotoAfterTakeoff(std::string& fail_reason_out)
 
   // transform the path to a MissionPlan for pixhawk
   mavsdk::Mission::MissionPlan mission_plan;
-  mission_plan.mission_items.push_back(to_mission_item(goal));
+  mission_plan.mission_items.push_back(to_mission_item(goal, false));
 
   // finally, let the MissionManager handle the upload & starting of the new mission
   return mission_mgr_->new_mission(mission_plan, 0, fail_reason_out);
@@ -2235,13 +2243,13 @@ void ControlInterface::printAndPublishWaypoints(const std::vector<local_waypoint
 
 /* to_mission_item //{ */
 template <typename T>
-mavsdk::Mission::MissionItem ControlInterface::to_mission_item(const T& w_in, const bool is_global)
+mavsdk::Mission::MissionItem ControlInterface::to_mission_item(const T& w_in, const bool is_global, const bool flythrough)
 {
   const local_waypoint_t w = to_local_waypoint(w_in, is_global);
-  return to_mission_item(w);
+  return to_mission_item(w, flythrough);
 }
 
-mavsdk::Mission::MissionItem ControlInterface::to_mission_item(const local_waypoint_t& w_in)
+mavsdk::Mission::MissionItem ControlInterface::to_mission_item(const local_waypoint_t& w_in, const bool flythrough)
 {
   local_waypoint_t w = w_in;
   // apply home offset correction
@@ -2258,12 +2266,12 @@ mavsdk::Mission::MissionItem ControlInterface::to_mission_item(const local_waypo
   item.yaw_deg = float(-radians(global.heading + heading_offset_correction_).convert<degrees>().value());
   item.speed_m_s = float(target_velocity_);  // NAN = use default values. This does NOT limit vehicle max speed
 
-  item.is_fly_through          = true;
-  item.gimbal_pitch_deg        = 0.0f;
-  item.gimbal_yaw_deg          = 0.0f;
+  item.is_fly_through          = flythrough;
+  item.gimbal_pitch_deg        = nanf;
+  item.gimbal_yaw_deg          = nanf;
   item.camera_action           = mavsdk::Mission::MissionItem::CameraAction::None;
   item.loiter_time_s           = (float)waypoint_loiter_time_;
-  item.camera_photo_interval_s = 0.0f;
+  item.camera_photo_interval_s = nanf;
   item.acceptance_radius_m     = waypoint_acceptance_radius_;
 
   return item;
