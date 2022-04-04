@@ -266,6 +266,7 @@ private:
   int    mission_max_upload_attempts_       = 5;
   rclcpp::Duration mission_starting_timeout_ = rclcpp::Duration::from_seconds(0.3);
   bool   require_bumper_ = false;
+  bool   final_waypoint_flythrough_ = false;
 
   // action server
   std::recursive_mutex action_server_mutex_;
@@ -436,6 +437,7 @@ ControlInterface::ControlInterface(rclcpp::NodeOptions options) : Node("control_
   loaded_successfully &= parse_param("general.diagnostics_publish_rate", diagnostics_publish_rate_, *this);
   loaded_successfully &= parse_param("general.print_callback_durations", print_callback_durations_, *this);
   loaded_successfully &= parse_param("general.print_callback_min_dur", print_callback_min_dur_, *this);
+  loaded_successfully &= parse_param("general.final_waypoint_flythrough", final_waypoint_flythrough_, *this);
 
   loaded_successfully &= parse_param("takeoff.height", takeoff_height_, *this);
   loaded_successfully &= parse_param("takeoff.position_samples", takeoff_position_samples_, *this);
@@ -1064,7 +1066,8 @@ bool ControlInterface::startNewMission(const T& path, const uint32_t id, const b
   {
     const auto& pose = path.at(it);
     const bool endpoint = it == path.size()-1;
-    mission_plan.mission_items.push_back(to_mission_item(pose, is_global, !endpoint));
+    const bool flythrough = !endpoint || final_waypoint_flythrough_;
+    mission_plan.mission_items.push_back(to_mission_item(pose, is_global, flythrough));
   }
 
   // stop the current mission (if any)
@@ -1979,7 +1982,8 @@ bool ControlInterface::gotoAfterTakeoff(std::string& fail_reason_out)
 
   // transform the path to a MissionPlan for pixhawk
   mavsdk::Mission::MissionPlan mission_plan;
-  mission_plan.mission_items.push_back(to_mission_item(goal, false));
+  const bool flythrough = final_waypoint_flythrough_;
+  mission_plan.mission_items.push_back(to_mission_item(goal, flythrough));
 
   // finally, let the MissionManager handle the upload & starting of the new mission
   return mission_mgr_->new_mission(mission_plan, 0, fail_reason_out);
