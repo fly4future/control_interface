@@ -200,8 +200,6 @@ private:
 
   std::atomic_bool system_connected_ = false; // set to true when MavSDK connection is established
   std::atomic_bool getting_control_mode_ = false; // set to true when a VehicleControlMode is received from pixhawk
-  std::atomic_bool getting_odom_ = false;
-  std::atomic_bool gps_origin_set_ = false;
 
   std::atomic_bool manual_override_ = false;
 
@@ -229,15 +227,17 @@ private:
   std::shared_ptr<mavsdk::System>  system_;
 
   // use takeoff lat and long to initialize local frame
-  std::mutex coord_transform_mutex_;
+  std::mutex home_position_mutex_;
   std::shared_ptr<mavsdk::geometry::CoordinateTransformation> coord_transform_;
-  Eigen::Vector3d home_position_offset_ = Eigen::Vector3d(0, 0, 0); // this is also protected by the coord_transform_mutex_
+  Eigen::Vector3d home_position_offset_ = Eigen::Vector3d(0, 0, 0); // this is also protected by the home_position_mutex_
+  std::atomic_bool gps_origin_set_ = false;
 
   // vehicle local position
   std::mutex pose_mutex_;
   boost::circular_buffer<Eigen::Vector3d> pose_takeoff_samples_;
   Eigen::Vector3d              pose_pos_;
   tf2::Quaternion              pose_ori_;
+  std::atomic_bool getting_odom_ = false;
 
   // diagnostics message from navigation (used to check for obstacles before takeoff)
   std::mutex nav_diags_mutex_;
@@ -291,6 +291,7 @@ private:
   std::vector<rclcpp::CallbackGroup::SharedPtr> callback_groups_;
   // new callback groups have to be initialized using this function to be saved into callback_groups_
   rclcpp::CallbackGroup::SharedPtr new_cbk_grp();
+  bool is_landed(const vehicle_state_t state);
 
   OnSetParametersCallbackHandle::SharedPtr parameters_callback_handle_;
 
@@ -302,7 +303,7 @@ private:
   // subscriber callbacks
   void controlModeCallback(const px4_msgs::msg::VehicleControlMode::UniquePtr msg);
   bool mavsdkLogCallback(const mavsdk::log::Level level, const std::string& message, const std::string& file, const int line);
-  void homePositionCallback(const px4_msgs::msg::HomePosition::UniquePtr msg);
+  void homePositionCallback(const mavsdk::Telemetry::Position msg);
   void odometryCallback(const nav_msgs::msg::Odometry::UniquePtr msg);
   void cmdPoseCallback(const px4_msgs::msg::VehicleLocalPositionSetpoint::UniquePtr msg);
   void navDiagsCallback(const fog_msgs::msg::NavigationDiagnostics::SharedPtr msg);
@@ -529,10 +530,6 @@ ControlInterface::ControlInterface(rclcpp::NodeOptions options) : Node("control_
       rclcpp::SystemDefaultsQoS(), std::bind(&ControlInterface::controlModeCallback, this, _1), subopts);
 
   subopts.callback_group = new_cbk_grp();
-  home_position_subscriber_ = create_subscription<px4_msgs::msg::HomePosition>("~/home_position_in",
-      rclcpp::SystemDefaultsQoS(), std::bind(&ControlInterface::homePositionCallback, this, _1), subopts);
-
-  subopts.callback_group = new_cbk_grp();
   odometry_subscriber_ = create_subscription<nav_msgs::msg::Odometry>("~/local_odom_in",
       rclcpp::SystemDefaultsQoS(), std::bind(&ControlInterface::odometryCallback, this, _1), subopts);
 
@@ -664,40 +661,33 @@ void ControlInterface::odometryCallback(const nav_msgs::msg::Odometry::UniquePtr
   scope_timer tim(print_callback_durations_, "odometryCallback", get_logger(), print_callback_throttle_, print_callback_min_dur_);
 
   const vehicle_state_t state = get_mutexed(state_mutex_, vehicle_state_);
-  getting_odom_ = true;
   RCLCPP_INFO_ONCE(get_logger(), "Getting odometry");
 
-  std::scoped_lock lck(pose_mutex_);
-
-  // update the current position and orientation of the vehicle
-  pose_pos_.x() = msg->pose.pose.position.x;
-  pose_pos_.y() = msg->pose.pose.position.y;
-  pose_pos_.z() = msg->pose.pose.position.z;
-  pose_ori_.setX(msg->pose.pose.orientation.x);
-  pose_ori_.setY(msg->pose.pose.orientation.y);
-  pose_ori_.setZ(msg->pose.pose.orientation.z);
-  pose_ori_.setW(msg->pose.pose.orientation.w);
-
-  // check if the vehicle is landed and therefore should average its position for takeoff
-  switch (state)
   {
-    // ignore these states
-    case vehicle_state_t::invalid:
-    case vehicle_state_t::taking_off:
-    case vehicle_state_t::autonomous_flight:
-    case vehicle_state_t::manual_flight:
-    case vehicle_state_t::landing:
-                      return;
-    // add the position sample in these states
-    case vehicle_state_t::not_connected:
-    case vehicle_state_t::not_ready:
-    case vehicle_state_t::arming_ready:
-    case vehicle_state_t::takeoff_ready:
-                      break;
+    std::scoped_lock lck(pose_mutex_);
+    
+    // update the current position and orientation of the vehicle
+    pose_pos_.x() = msg->pose.pose.position.x;
+    pose_pos_.y() = msg->pose.pose.position.y;
+    pose_pos_.z() = msg->pose.pose.position.z;
+    pose_ori_.setX(msg->pose.pose.orientation.x);
+    pose_ori_.setY(msg->pose.pose.orientation.y);
+    pose_ori_.setZ(msg->pose.pose.orientation.z);
+    pose_ori_.setW(msg->pose.pose.orientation.w);
+    
+    // check if the vehicle is landed and therefore should average its position for takeoff
+    if (!is_landed(state))
+      return;
+    
+    // add the current position to the pose samples for takeoff position estimation
+    pose_takeoff_samples_.push_back(pose_pos_);
   }
 
-  // add the current position to the pose samples for takeoff position estimation
-  pose_takeoff_samples_.push_back(pose_pos_);
+  // also set the home offset if the flow got here (the vehicle is landed)
+  set_mutexed(home_position_mutex_, pose_pos_, home_position_offset_);
+  RCLCPP_INFO_STREAM_THROTTLE(get_logger(), *get_clock(), 5000, "Home position offset (local): " << pose_pos_.transpose());
+
+  getting_odom_ = true;
 }
 //}
 
@@ -733,23 +723,23 @@ void ControlInterface::odometryCallback(const nav_msgs::msg::Odometry::UniquePtr
   //}
 
 /* homePositionCallback //{ */
-void ControlInterface::homePositionCallback(const px4_msgs::msg::HomePosition::UniquePtr msg)
+void ControlInterface::homePositionCallback(const mavsdk::Telemetry::Position msg)
 {
   scope_timer tim(print_callback_durations_, "homePositionCallback", get_logger(), print_callback_throttle_, print_callback_min_dur_);
+    
+  const vehicle_state_t state = fog_lib::get_mutexed(state_mutex_, vehicle_state_);
+  // check if the vehicle is landed and therefore should average its position for takeoff
+  if (!is_landed(state))
+    return;
 
   mavsdk::geometry::CoordinateTransformation::GlobalCoordinate tf;
-  tf.latitude_deg  = msg->lat;
-  tf.longitude_deg = msg->lon;
+  tf.latitude_deg  = msg.latitude_deg;
+  tf.longitude_deg = msg.longitude_deg;
   const auto new_tf = std::make_shared<mavsdk::geometry::CoordinateTransformation>(mavsdk::geometry::CoordinateTransformation(tf));
-  const Eigen::Vector3d new_home_offset(msg->y, msg->x, -msg->z);
 
-  set_mutexed(coord_transform_mutex_, 
-      std::make_tuple(new_tf, new_home_offset),
-      std::forward_as_tuple(coord_transform_, home_position_offset_)
-    );
+  set_mutexed(home_position_mutex_, new_tf, coord_transform_);
 
-  RCLCPP_INFO(get_logger(), "GPS origin set! Lat: %.6f, Lon: %.6f", tf.latitude_deg, tf.longitude_deg);
-  RCLCPP_INFO_STREAM(get_logger(), "Home position offset (local): " << new_home_offset.transpose());
+  RCLCPP_INFO_STREAM(get_logger(), "GPS origin set! Lat: " << tf.latitude_deg << ", Lon: " << tf.longitude_deg);
 
   gps_origin_set_ = true;
 }
@@ -2022,7 +2012,11 @@ bool ControlInterface::connectPixHawk()
     param_   = std::make_shared<mavsdk::Param>(system_);
     telem_   = std::make_shared<mavsdk::Telemetry>(system_);
     mission_mgr_ = std::make_unique<MissionManager>(mission_max_upload_attempts_, mission_starting_timeout_, system_, get_logger(), get_clock(), mission_publisher_, mission_mgr_mutex_);
-    MissionManager::state_update_cbk_t state_update_cbk = std::bind(&ControlInterface::missionStateUpdateCallback, this);
+
+    // setup subscriptions
+    const mavsdk::Telemetry::HomeCallback home_position_cbk = std::bind(&ControlInterface::homePositionCallback, this, _1);
+    telem_->subscribe_home(home_position_cbk);
+    const MissionManager::state_update_cbk_t state_update_cbk = std::bind(&ControlInterface::missionStateUpdateCallback, this);
     mission_mgr_->subscribe_state_update(state_update_cbk);
 
     // set the initialized flag to true so that px4 parameters may be initialized
@@ -2261,7 +2255,7 @@ mavsdk::Mission::MissionItem ControlInterface::to_mission_item(const local_waypo
   w.y -= home_position_offset_.y();
   w.z -= home_position_offset_.z();
 
-  const auto tf = get_mutexed(coord_transform_mutex_, coord_transform_);
+  const auto tf = get_mutexed(home_position_mutex_, coord_transform_);
   mavsdk::Mission::MissionItem item;
   gps_waypoint_t global = localToGlobal(tf, w);
   item.latitude_deg = global.latitude;
@@ -2296,7 +2290,7 @@ local_waypoint_t ControlInterface::to_local_waypoint(const mavsdk::Mission::Miss
   global.altitude = in.relative_altitude_m;
   global.heading = degrees(-in.yaw_deg).convert<radians>().value() - heading_offset_correction_;
 
-  const auto [tf, offset] = get_mutexed(coord_transform_mutex_, coord_transform_, home_position_offset_);
+  const auto [tf, offset] = get_mutexed(home_position_mutex_, coord_transform_, home_position_offset_);
   local_waypoint_t w = globalToLocal(tf, global, offset);
 
   return w;
@@ -2323,7 +2317,7 @@ local_waypoint_t ControlInterface::to_local_waypoint(const Eigen::Vector4d& in, 
 {
   if (is_global)
   {
-    const auto [tf, offset] = get_mutexed(coord_transform_mutex_, coord_transform_, home_position_offset_);
+    const auto [tf, offset] = get_mutexed(home_position_mutex_, coord_transform_, home_position_offset_);
     gps_waypoint_t wp;
     wp.latitude = in.x();
     wp.longitude = in.y();
@@ -2352,6 +2346,27 @@ rclcpp::CallbackGroup::SharedPtr ControlInterface::new_cbk_grp()
   return new_group;
 }
 //}
+
+bool ControlInterface::is_landed(const vehicle_state_t state)
+{
+  switch (state)
+  {
+    // these states mean that the vehicle is on the ground
+    case vehicle_state_t::not_connected:
+    case vehicle_state_t::not_ready:
+    case vehicle_state_t::arming_ready:
+    case vehicle_state_t::takeoff_ready:
+                      return true;
+    // these states mean that the vehicle is in-air or unknown
+    case vehicle_state_t::invalid:
+    case vehicle_state_t::taking_off:
+    case vehicle_state_t::autonomous_flight:
+    case vehicle_state_t::manual_flight:
+    case vehicle_state_t::landing:
+    default:
+                      return false;
+  }
+}
 
 //}
 
