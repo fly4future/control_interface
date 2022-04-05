@@ -663,29 +663,28 @@ void ControlInterface::odometryCallback(const nav_msgs::msg::Odometry::UniquePtr
   const vehicle_state_t state = get_mutexed(state_mutex_, vehicle_state_);
   RCLCPP_INFO_ONCE(get_logger(), "Getting odometry");
 
-  {
-    std::scoped_lock lck(pose_mutex_);
-    
-    // update the current position and orientation of the vehicle
-    pose_pos_.x() = msg->pose.pose.position.x;
-    pose_pos_.y() = msg->pose.pose.position.y;
-    pose_pos_.z() = msg->pose.pose.position.z;
-    pose_ori_.setX(msg->pose.pose.orientation.x);
-    pose_ori_.setY(msg->pose.pose.orientation.y);
-    pose_ori_.setZ(msg->pose.pose.orientation.z);
-    pose_ori_.setW(msg->pose.pose.orientation.w);
-    
-    // check if the vehicle is landed and therefore should average its position for takeoff
-    if (!is_landed(state))
-      return;
-    
-    // add the current position to the pose samples for takeoff position estimation
-    pose_takeoff_samples_.push_back(pose_pos_);
-  }
+  const vec3_t recvd_pos(msg->pose.pose.position.x, msg->pose.pose.position.y, msg->pose.pose.position.z);
 
   // also set the home offset if the flow got here (the vehicle is landed)
-  set_mutexed(home_position_mutex_, pose_pos_, home_position_offset_);
-  RCLCPP_INFO_STREAM_THROTTLE(get_logger(), *get_clock(), 5000, "Home position offset (local): " << pose_pos_.transpose());
+  const vec3_t home_pos = get_mutexed(home_position_mutex_, home_position_offset_);
+  if (home_pos != recvd_pos)
+  {
+    set_mutexed(home_position_mutex_, pose_pos_, home_position_offset_);
+    RCLCPP_INFO_STREAM(get_logger(), "New home position offset (local): " << pose_pos_.transpose());
+  }
+
+  std::scoped_lock lck(pose_mutex_);
+  
+  // update the current position and orientation of the vehicle
+  pose_pos_ = recvd_pos;
+  pose_ori_.setX(msg->pose.pose.orientation.x);
+  pose_ori_.setY(msg->pose.pose.orientation.y);
+  pose_ori_.setZ(msg->pose.pose.orientation.z);
+  pose_ori_.setW(msg->pose.pose.orientation.w);
+  
+  // check if the vehicle is landed and therefore should average its position for takeoff
+  if (is_landed(state))
+    pose_takeoff_samples_.push_back(recvd_pos);
 
   getting_odom_ = true;
 }
