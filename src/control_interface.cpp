@@ -665,14 +665,6 @@ void ControlInterface::odometryCallback(const nav_msgs::msg::Odometry::UniquePtr
 
   const vec3_t recvd_pos(msg->pose.pose.position.x, msg->pose.pose.position.y, msg->pose.pose.position.z);
 
-  // also set the home offset if the flow got here (the vehicle is landed)
-  const vec3_t home_pos = get_mutexed(home_position_mutex_, home_position_offset_);
-  if (home_pos != recvd_pos)
-  {
-    set_mutexed(home_position_mutex_, pose_pos_, home_position_offset_);
-    RCLCPP_INFO_STREAM(get_logger(), "New home position offset (local): " << pose_pos_.transpose());
-  }
-
   std::scoped_lock lck(pose_mutex_);
   
   // update the current position and orientation of the vehicle
@@ -726,19 +718,27 @@ void ControlInterface::homePositionCallback(const mavsdk::Telemetry::Position ms
 {
   scope_timer tim(print_callback_durations_, "homePositionCallback", get_logger(), print_callback_throttle_, print_callback_min_dur_);
     
-  const vehicle_state_t state = fog_lib::get_mutexed(state_mutex_, vehicle_state_);
-  // check if the vehicle is landed and therefore should average its position for takeoff
-  if (!is_landed(state))
-    return;
+  mavsdk::geometry::CoordinateTransformation::GlobalCoordinate global_pos;
+  global_pos.latitude_deg  = msg.latitude_deg;
+  global_pos.longitude_deg = msg.longitude_deg;
 
-  mavsdk::geometry::CoordinateTransformation::GlobalCoordinate tf;
-  tf.latitude_deg  = msg.latitude_deg;
-  tf.longitude_deg = msg.longitude_deg;
-  const auto new_tf = std::make_shared<mavsdk::geometry::CoordinateTransformation>(mavsdk::geometry::CoordinateTransformation(tf));
+  // if there already is a gps origin set, check if it's new
+  if (gps_origin_set_)
+  {
+    const auto cur_tf = get_mutexed(home_position_mutex_, coord_transform_);
+    const mavsdk::geometry::CoordinateTransformation::LocalCoordinate origin = {0, 0};
+    const auto cur_pos = cur_tf->global_from_local(origin);
+    // do nothing if the transformations are the same
+    if (cur_pos.latitude_deg == global_pos.latitude_deg && cur_pos.longitude_deg == global_pos.longitude_deg)
+      return;
+    RCLCPP_INFO_STREAM(get_logger(), "Old GPS origin is Lat: " << cur_pos.latitude_deg << ", Lon: " << cur_pos.longitude_deg);
+  }
 
+  // otherwise, update it
+  const auto new_tf = std::make_shared<mavsdk::geometry::CoordinateTransformation>(mavsdk::geometry::CoordinateTransformation(global_pos));
   set_mutexed(home_position_mutex_, new_tf, coord_transform_);
 
-  RCLCPP_INFO_STREAM(get_logger(), "GPS origin set! Lat: " << tf.latitude_deg << ", Lon: " << tf.longitude_deg);
+  RCLCPP_INFO_STREAM(get_logger(), "New GPS origin set! Lat: " << global_pos.latitude_deg << ", Lon: " << global_pos.longitude_deg);
 
   gps_origin_set_ = true;
 }
@@ -2102,6 +2102,10 @@ bool ControlInterface::startTakeoff(std::string& fail_reason_out)
     RCLCPP_WARN_STREAM(get_logger(), "Not taking off: " << fail_reason_out);
     return false;
   }
+
+  const vec3_t cur_pos = get_mutexed(pose_mutex_, pose_pos_);
+  set_mutexed(home_position_mutex_, cur_pos, home_position_offset_);
+  RCLCPP_INFO_STREAM(get_logger(), "Home position offset (local): " << cur_pos.transpose());
 
   const auto takeoff_result = action_->takeoff();
   if (takeoff_result != mavsdk::Action::Result::Success)
